@@ -1,12 +1,19 @@
 """Merged master predictor combining SCR1–SCR9 behaviours.
 
-This script centralises data loading, backtesting, and stake sizing while
-keeping each legacy logic mathematically close to its original intent. Heavy
-ML components are represented with lighter-weight equivalents to keep runtime
-manageable inside a single file; section headers highlight which portion of the
-legacy pipeline they mirror.
+Upgrades in this version:
+- CLI modes: NEW (default), OLD, and COMPARE for side-by-side trust-building.
+- Output refresh with A/B/C stake tiers, snapshots, and pattern/risk panels.
+- Dynamic pick counts (3–5) driven by consensus/score shape instead of a
+  hard-coded top_k=5, plus an old-style formatter for legacy clarity.
+
+Logic inspiration borrowed from historical modules such as
+``deepseek_scr9.py``, ``pattern_packs.py``, ``high_conviction_filter.py``, and
+``bet_pnl_tracker.py`` while compressing behaviour into this single file. Some
+assumptions are made around money-management caps and risk labels to keep the
+implementation lightweight but still faithful to the previous ecosystem.
 """
 from __future__ import annotations
+import argparse
 import math
 import os
 from collections import Counter, defaultdict
@@ -34,6 +41,8 @@ PACK_164950_FAMILY = {f"{a}{b}" for a in FAMILY_DIGITS for b in FAMILY_DIGITS}
 BASE_STAKE = 10.0
 RETURN_EXACT = 90
 RETURN_DIGIT = 9
+TIER_MULTIPLIERS = {"A": 2.0, "B": 1.0, "C": 0.5}
+ANDAR_BAHAR_MULTIPLIER = 1.0
 
 
 # ------------------------------ DATA UTILITIES ------------------------------
@@ -84,6 +93,74 @@ def andar_bahar_from_predictions(preds: Sequence[int]) -> Tuple[int, int]:
     tens = [p // 10 for p in preds]
     ones = [p % 10 for p in preds]
     return Counter(tens).most_common(1)[0][0], Counter(ones).most_common(1)[0][0]
+
+
+def decide_top_k_for_slot(scores: Counter, base_top_k: int = 5) -> int:
+    """Decide between 3–5 picks based on score spread/variance.
+
+    A sharp drop after the top few scores or high variance means we
+    confidently trim to 3; a modest edge trims to 4; otherwise stay at 5.
+    """
+
+    if not scores:
+        return base_top_k
+    values = sorted(scores.values(), reverse=True)
+    if len(values) <= 3:
+        return max(1, len(values))
+
+    pivot = values[min(4, len(values) - 1)]
+    top = values[0]
+    ratio = top / max(values[min(2, len(values) - 1)], 1e-6)
+    std = float(np.std(values[: min(5, len(values))]))
+
+    if (top - pivot) > (0.35 * top) or ratio > 1.8:
+        return 3
+    if ratio > 1.3 or std > 0.15 * top:
+        return 4
+    return base_top_k
+
+
+def assign_tiers(scores: Dict[int, float], picks: List[int], u_live: float) -> List[Dict[str, float]]:
+    ranks = sorted(picks, key=lambda n: scores.get(n, 0), reverse=True)
+    tiered = []
+    for idx, num in enumerate(ranks):
+        if idx < 2:
+            tier = "A"
+        elif idx < 4:
+            tier = "B"
+        else:
+            tier = "C"
+        stake_val = TIER_MULTIPLIERS[tier] * u_live
+        tiered.append({"num": num, "tier": tier, "stake": stake_val})
+    return tiered
+
+
+def format_slot_line_old_style(
+    slot_name: str,
+    tiered: List[Dict[str, float]],
+    andar: int,
+    bahar: int,
+    andar_stake: float,
+    bahar_stake: float,
+) -> Tuple[str, float]:
+    parts = [f"{two_digit(item['num'])}({item['tier']} ₹{item['stake']:.0f})" for item in tiered]
+    numbers_block = ", ".join(parts)
+    slot_stake = sum(item["stake"] for item in tiered) + andar_stake + bahar_stake
+    line = (
+        f"{slot_name}: {numbers_block} | ANDAR={andar} (₹{andar_stake:.0f}), "
+        f"BAHAR={bahar} (₹{bahar_stake:.0f}) → Slot stake: ₹{slot_stake:.0f}"
+    )
+    return line, slot_stake
+
+
+def compute_slot_confidence(scores: Dict[int, float]) -> float:
+    if not scores:
+        return 0.0
+    values = sorted(scores.values(), reverse=True)
+    top3 = sum(values[:3])
+    total = sum(values)
+    ratio = top3 / total if total else 0.0
+    return round(min(100.0, ratio * 120), 1)
 
 
 # --------------------------- LOGIC: SCR1 (LIGHT) ---------------------------
@@ -376,6 +453,13 @@ class LogicPerformance:
     hits: int
 
 
+@dataclass
+class CombinedPrediction:
+    picks: Dict[int, List[int]]
+    scores: Dict[int, Dict[int, float]]
+    top_k_by_slot: Dict[int, int]
+
+
 def evaluate_day_predictions(actual: Dict[int, int], predicted: List[int], andar: int, bahar: int, stake: float) -> float:
     total_stake = stake * len(predicted) + 2 * stake
     returns = 0.0
@@ -423,6 +507,23 @@ def backtest_logic(df: pd.DataFrame, predictor, name: str, window: int = 60, top
     return LogicPerformance(name=name, roi=roi, profit=profit, hits=hits)
 
 
+def compute_logic_performance_table(df_long: pd.DataFrame) -> Tuple[Dict[str, LogicPerformance], Dict[str, float], float]:
+    perf_table: Dict[str, LogicPerformance] = {}
+    for name, func in [
+        ("SCR1", scr1_predict),
+        ("SCR2", scr2_predict),
+        ("SCR3", scr3_predict),
+        ("SCR4", scr45_predict),
+        ("SCR5", scr45_predict),
+        ("SCR6", scr6_predict),
+        ("SCR8", lambda d, td, tk: scr8_predict(td, tk)),
+    ]:
+        perf_table[name] = backtest_logic(df_long, func, name)
+    roi_table = {name: perf.roi for name, perf in perf_table.items()}
+    cumulative_profit = sum(perf.profit for perf in perf_table.values())
+    return perf_table, roi_table, cumulative_profit
+
+
 def adjust_stake(profit_history: float, base: float = BASE_STAKE) -> float:
     if profit_history < -100:
         return base * 1.25
@@ -433,12 +534,8 @@ def adjust_stake(profit_history: float, base: float = BASE_STAKE) -> float:
     return base
 
 
-# -------------------------- MAIN DECISION PIPELINE -------------------------
-def combine_predictions(pred_maps: Dict[str, Dict[int, List[int]]], roi_table: Dict[str, float], top_k: int = 5) -> Dict[int, List[int]]:
-    ordered_names = list(pred_maps.keys())
-    roi_weights = {name: max(0.1, roi_table.get(name, 0.0) + 1.0) for name in ordered_names}
-    preds_list = [pred_maps[name] for name in ordered_names]
-    return scr9_predict(preds_list, roi_weights, top_k)
+def compute_roi_weights(roi_table: Dict[str, float]) -> Dict[str, float]:
+    return {name: max(0.1, roi + 1.0) for name, roi in roi_table.items()}
 
 
 def generate_all_logic_predictions(df: pd.DataFrame, target_date: pd.Timestamp, top_k: int = 5) -> Dict[str, Dict[int, List[int]]]:
@@ -461,11 +558,226 @@ def generate_all_logic_predictions(df: pd.DataFrame, target_date: pd.Timestamp, 
     }
 
 
+def combine_predictions(
+    pred_maps: Dict[str, Dict[int, List[int]]],
+    roi_table: Dict[str, float],
+    base_top_k: int = 5,
+    dynamic_topk: bool = True,
+) -> CombinedPrediction:
+    roi_weights = compute_roi_weights(roi_table)
+    slot_scores: Dict[int, Counter] = {slot: Counter() for slot in [1, 2, 3, 4]}
+    for name, preds in pred_maps.items():
+        weight = roi_weights.get(name, 1.0)
+        for slot, nums in preds.items():
+            for rank, num in enumerate(nums):
+                slot_scores[slot][num] += weight / (rank + 1)
+    picks: Dict[int, List[int]] = {}
+    top_k_by_slot: Dict[int, int] = {}
+    for slot, counter in slot_scores.items():
+        k = decide_top_k_for_slot(counter, base_top_k) if dynamic_topk else base_top_k
+        top_k_by_slot[slot] = max(3, min(base_top_k, k))
+        picks[slot] = [n for n, _ in counter.most_common(top_k_by_slot[slot])]
+    return CombinedPrediction(
+        picks=picks,
+        scores={slot: dict(counter) for slot, counter in slot_scores.items()},
+        top_k_by_slot=top_k_by_slot,
+    )
+
+
 def prediction_summary(pred: Dict[int, List[int]]) -> Dict[str, List[str]]:
     return {SLOT_NAMES[slot - 1]: [two_digit(n) for n in nums] for slot, nums in pred.items()}
 
 
+def run_combined_backtest(
+    df_long: pd.DataFrame, roi_table: Dict[str, float], dynamic_topk: bool = True, window: int = 60
+) -> Dict[str, object]:
+    dates = sorted(df_long["date"].unique())
+    if len(dates) < 2:
+        return {
+            "profit": 0.0,
+            "roi": 0.0,
+            "profit_by_slot": Counter(),
+            "profit_by_date": defaultdict(float),
+            "stake_by_date": defaultdict(float),
+            "stake_total": 0.0,
+        }
+    start_idx = max(1, len(dates) - window)
+    profit = 0.0
+    stake_total = 0.0
+    profit_by_slot: Counter = Counter()
+    profit_by_date: defaultdict = defaultdict(float)
+    stake_by_date: defaultdict = defaultdict(float)
+
+    for i in range(start_idx, len(dates)):
+        target_date = dates[i]
+        hist = df_long[df_long["date"] < target_date]
+        if hist.empty:
+            continue
+        logic_preds = generate_all_logic_predictions(hist, target_date, top_k=5)
+        combined = combine_predictions(logic_preds, roi_table, dynamic_topk=dynamic_topk)
+        flat_preds = [n for nums in combined.picks.values() for n in nums]
+        andar, bahar = andar_bahar_from_predictions(flat_preds)
+        day_stake = 0.0
+        for _, row in df_long[df_long["date"] == target_date].iterrows():
+            slot = int(row["slot"])
+            actual_num = int(row["number"])
+            tens, ones = actual_num // 10, actual_num % 10
+            picks = combined.picks.get(slot, [])
+            stake = BASE_STAKE
+            stake_for_row = stake * len(picks) + 2 * stake
+            day_stake += stake_for_row
+            profit_delta = evaluate_day_predictions(
+                {"number": actual_num, "tens": tens, "ones": ones},
+                picks,
+                andar,
+                bahar,
+                stake,
+            )
+            profit += profit_delta
+            profit_by_slot[slot] += profit_delta
+            profit_by_date[target_date] += profit_delta
+            stake_by_date[target_date] += stake_for_row
+        stake_total += day_stake
+    roi = (profit / stake_total * 100) if stake_total else 0.0
+    return {
+        "profit": profit,
+        "roi": roi,
+        "profit_by_slot": profit_by_slot,
+        "profit_by_date": profit_by_date,
+        "stake_by_date": stake_by_date,
+        "stake_total": stake_total,
+    }
+
+
+def compute_window(profit_by_date: Dict[pd.Timestamp, float], stake_by_date: Dict[pd.Timestamp, float], days: int) -> Tuple[float, float]:
+    if not profit_by_date:
+        return 0.0, 0.0
+    max_date = max(profit_by_date.keys())
+    start = max_date - timedelta(days=days - 1)
+    profit = sum(v for d, v in profit_by_date.items() if d >= start)
+    stake = sum(v for d, v in stake_by_date.items() if d >= start)
+    roi = (profit / stake * 100) if stake else 0.0
+    return profit, roi
+
+
+def compute_pnl_snapshot(df_long: pd.DataFrame, roi_table: Dict[str, float], dynamic_topk: bool) -> Dict[str, object]:
+    sim = run_combined_backtest(df_long, roi_table, dynamic_topk=dynamic_topk)
+    best_slot_idx = max(sim["profit_by_slot"], key=lambda k: sim["profit_by_slot"][k], default=1)
+    weak_slot_idx = min(sim["profit_by_slot"], key=lambda k: sim["profit_by_slot"][k], default=1)
+    last7_profit, last7_roi = compute_window(sim["profit_by_date"], sim["stake_by_date"], 7)
+    last30_profit, last30_roi = compute_window(sim["profit_by_date"], sim["stake_by_date"], 30)
+    return {
+        "overall_profit": sim["profit"],
+        "overall_roi": sim["roi"],
+        "last7": {"profit": last7_profit, "roi": last7_roi},
+        "last30": {"profit": last30_profit, "roi": last30_roi},
+        "best_slot": SLOT_NAMES[best_slot_idx - 1],
+        "weak_slot": SLOT_NAMES[weak_slot_idx - 1],
+    }
+
+
+def compute_pattern_stats(df_long: pd.DataFrame) -> Dict[str, float]:
+    if df_long.empty:
+        return {
+            "hits": 0,
+            "s40_hits": 0,
+            "pack_hits": 0,
+            "s40_hit_rate": 0.0,
+            "pack_hit_rate": 0.0,
+        }
+    hits = len(df_long)
+    s40_hits = sum(1 for n in df_long["number"] if two_digit(n) in S40)
+    pack_hits = sum(1 for n in df_long["number"] if two_digit(n) in PACK_164950_FAMILY)
+    return {
+        "hits": hits,
+        "s40_hits": s40_hits,
+        "pack_hits": pack_hits,
+        "s40_hit_rate": (s40_hits / hits * 100) if hits else 0.0,
+        "pack_hit_rate": (pack_hits / hits * 100) if hits else 0.0,
+    }
+
+
+def compute_risk_execution_summary(
+    pnl_snapshot: Dict[str, object],
+    pattern_stats: Dict[str, float],
+    confidence: Dict[str, float],
+    u_live: float,
+) -> Dict[str, object]:
+    roi = pnl_snapshot.get("overall_roi", 0.0)
+    if roi > 12:
+        risk_mode = "AGGRESSIVE"
+    elif roi > 0:
+        risk_mode = "NORMAL"
+    else:
+        risk_mode = "DEFENSIVE"
+
+    strategy = "STRAT_S40_BOOST" if pattern_stats.get("s40_hit_rate", 0.0) > 32 else "BALANCED_ROI"
+    exec_mode = "GO_LIVE_FULL" if risk_mode == "AGGRESSIVE" else "GO_LIVE_LIGHT"
+    money_mgr = {
+        "daily_cap": u_live * 80,
+        "slot_cap": u_live * 20,
+    }
+    return {
+        "strategy": strategy,
+        "risk_mode": risk_mode,
+        "execution": exec_mode,
+        "money_manager": money_mgr,
+        "confidence": confidence,
+    }
+
+
+def build_mode_prediction(
+    scope_df: pd.DataFrame,
+    tgt_date: pd.Timestamp,
+    roi_table: Dict[str, float],
+    u_live: float,
+    intraday: bool,
+    missing_slots: List[int],
+    latest_date: pd.Timestamp,
+    dynamic_topk: bool,
+) -> Dict[str, object]:
+    logic_preds = generate_all_logic_predictions(scope_df, tgt_date, top_k=5)
+    combined = combine_predictions(logic_preds, roi_table, dynamic_topk=dynamic_topk)
+    flat_preds = [n for nums in combined.picks.values() for n in nums]
+    andar, bahar = andar_bahar_from_predictions(flat_preds)
+    andar_stake = ANDAR_BAHAR_MULTIPLIER * u_live
+    bahar_stake = ANDAR_BAHAR_MULTIPLIER * u_live
+
+    lines: List[str] = []
+    slot_stakes: Dict[str, float] = {}
+    confidence: Dict[str, float] = {}
+    picks_by_slot: Dict[str, List[int]] = {}
+    for slot_idx in [1, 2, 3, 4]:
+        if intraday and tgt_date == latest_date and slot_idx not in missing_slots:
+            continue
+        slot_name = SLOT_NAMES[slot_idx - 1]
+        picks = combined.picks.get(slot_idx, [])
+        slot_scores = combined.scores.get(slot_idx, {})
+        tiered = assign_tiers(slot_scores, picks, u_live)
+        line, slot_stake = format_slot_line_old_style(slot_name, tiered, andar, bahar, andar_stake, bahar_stake)
+        lines.append(line)
+        slot_stakes[slot_name] = slot_stake
+        confidence[slot_name] = compute_slot_confidence(slot_scores)
+        picks_by_slot[slot_name] = picks
+
+    total_stake = sum(slot_stakes.values())
+    return {
+        "lines": lines,
+        "andar": andar,
+        "bahar": bahar,
+        "slot_stakes": slot_stakes,
+        "total_stake": total_stake,
+        "confidence": confidence,
+        "picks_by_slot": picks_by_slot,
+        "combined": combined,
+    }
+
+
 def main():
+    parser = argparse.ArgumentParser(description="Merged master predictor")
+    parser.add_argument("--mode", choices=["NEW", "OLD", "COMPARE"], default="NEW", help="Prediction mode")
+    args = parser.parse_args()
+
     print("=== MERGED MASTER PREDICTOR (SCR1–SCR9) ===")
     excel_path = "number prediction learn.xlsx"
     df_long = load_long_dataframe(excel_path)
@@ -483,49 +795,221 @@ def main():
         target_dates.append(latest_date)
     target_dates.append(latest_date + timedelta(days=1))
 
-    # Backtest to score logics
-    perf_table: Dict[str, LogicPerformance] = {}
-    for name, func in [
-        ("SCR1", scr1_predict),
-        ("SCR2", scr2_predict),
-        ("SCR3", scr3_predict),
-        ("SCR4", scr45_predict),
-        ("SCR5", scr45_predict),
-        ("SCR6", scr6_predict),
-        ("SCR8", lambda d, td, tk: scr8_predict(td, tk)),
-    ]:
-        perf_table[name] = backtest_logic(df_long, func, name)
-    roi_table = {name: perf.roi for name, perf in perf_table.items()}
+    perf_table, roi_table, cumulative_profit = compute_logic_performance_table(df_long)
+    u_live = adjust_stake(cumulative_profit, BASE_STAKE)
+    pattern_stats = compute_pattern_stats(df_long)
+    pnl_snapshot_new = compute_pnl_snapshot(df_long, roi_table, dynamic_topk=True)
+    pnl_snapshot_old = compute_pnl_snapshot(df_long, roi_table, dynamic_topk=False)
+    top_logic = max(perf_table.values(), key=lambda p: p.roi)
 
-    cumulative_profit = sum(perf.profit for perf in perf_table.values())
-    stake = adjust_stake(cumulative_profit, BASE_STAKE)
+    last_pred_block: Optional[Dict[str, object]] = None
 
     for tgt_date in target_dates:
         scope_df = df_long[df_long["date"] < tgt_date]
         if scope_df.empty:
             continue
-        logic_preds = generate_all_logic_predictions(scope_df, tgt_date, top_k=5)
-        combined = combine_predictions(logic_preds, roi_table, top_k=5)
-        summary = prediction_summary(combined)
-        andar, bahar = andar_bahar_from_predictions([n for nums in combined.values() for n in nums])
-        total_stake = stake * sum(len(v) for v in combined.values()) + 2 * stake * len(combined)
         header = "INTRADAY" if tgt_date == latest_date else "NEXT DAY"
         print(f"\n🗓️ Prediction date: {tgt_date.date()} ({header})")
-        for slot_name, nums in summary.items():
-            if intraday and tgt_date == latest_date:
-                slot_idx = SLOT_MAP[slot_name]
-                if slot_idx not in missing_slots:
-                    continue
-            print(f"  {slot_name}: {', '.join(nums)}")
-        print(f"  ANDAR digit: {andar} | BAHAR digit: {bahar}")
-        print(f"  Stake per pick: ₹{stake:.2f} | Estimated total stake: ₹{total_stake:.2f}")
-        top_logic = max(perf_table.values(), key=lambda p: p.roi)
-        print(f"  Leading logic: {top_logic.name} ({top_logic.roi:.2f}% ROI last window)")
 
-    # Optional: show detected pattern strength
-    strong_s40 = [n for n in combined.values() if any(two_digit(x) in S40 for x in n)]
-    if strong_s40:
-        print("\n✨ S40 alignment detected in combined picks – treat as bonus confidence layer.")
+        if args.mode in {"NEW", "COMPARE"}:
+            new_pred = build_mode_prediction(
+                scope_df,
+                tgt_date,
+                roi_table,
+                u_live,
+                intraday,
+                missing_slots,
+                latest_date,
+                dynamic_topk=True,
+            )
+            confidence_map = new_pred["confidence"]
+            risk_summary = compute_risk_execution_summary(pnl_snapshot_new, pattern_stats, confidence_map, u_live)
+            last_pred_block = new_pred
+
+        if args.mode == "NEW":
+            print("1️⃣ FINAL PREDICTIONS (NEW ENGINE)")
+            for line in new_pred["lines"]:
+                print(f"   {line}")
+            print(f"   Total stake (incl. digits): ₹{new_pred['total_stake']:.0f}")
+            print(f"   ANDAR={new_pred['andar']} | BAHAR={new_pred['bahar']}")
+            print(f"   Leading logic: {top_logic.name} ({top_logic.roi:.2f}% ROI last window)")
+
+            print("\n2️⃣ P&L SNAPSHOT (BACKTESTED)")
+            print(
+                f"   Overall P&L      : ₹{pnl_snapshot_new['overall_profit']:.0f} "
+                f"(ROI {pnl_snapshot_new['overall_roi']:.2f}%)"
+            )
+            print(
+                f"   Last 7 days      : ₹{pnl_snapshot_new['last7']['profit']:.0f} "
+                f"(ROI {pnl_snapshot_new['last7']['roi']:.2f}%)"
+            )
+            print(
+                f"   Last 30 days     : ₹{pnl_snapshot_new['last30']['profit']:.0f} "
+                f"(ROI {pnl_snapshot_new['last30']['roi']:.2f}%)"
+            )
+            print(f"   Best slot        : {pnl_snapshot_new['best_slot']}")
+            print(f"   Weak slot        : {pnl_snapshot_new['weak_slot']}")
+
+            print("\n3️⃣ PATTERN & LEARNING")
+            print(f"   Hits analyzed    : {pattern_stats['hits']}")
+            print(
+                f"   S40 family       : {pattern_stats['s40_hit_rate']:.1f}% hit rate, "
+                f"{pattern_stats['s40_hits']} hits"
+            )
+            print(
+                f"   164950 family    : {pattern_stats['pack_hit_rate']:.1f}% hit rate, "
+                f"{pattern_stats['pack_hits']} hits"
+            )
+
+            print("\n4️⃣ RISK & EXECUTION")
+            print(f"   Strategy         : {risk_summary['strategy']}")
+            print(f"   Risk mode        : {risk_summary['risk_mode']}")
+            print(f"   Execution mode   : {risk_summary['execution']}")
+            print(
+                f"   Money manager    : daily cap ₹{risk_summary['money_manager']['daily_cap']:.0f}, "
+                f"single-slot cap ₹{risk_summary['money_manager']['slot_cap']:.0f}"
+            )
+            conf_parts = ", ".join([f"{k} {v:.1f}%" for k, v in confidence_map.items()])
+            print(f"   Confidence       : {conf_parts}")
+
+        if args.mode == "OLD":
+            old_pred = build_mode_prediction(
+                scope_df,
+                tgt_date,
+                roi_table,
+                u_live,
+                intraday,
+                missing_slots,
+                latest_date,
+                dynamic_topk=False,
+            )
+            print("1️⃣ FINAL PREDICTIONS (OLD STYLE)")
+            for line in old_pred["lines"]:
+                print(f"   {line}")
+            print(f"   Total stake (incl. digits): ₹{old_pred['total_stake']:.0f}")
+            print(f"   ANDAR={old_pred['andar']} | BAHAR={old_pred['bahar']}")
+            print(f"   Leading logic: {top_logic.name} ({top_logic.roi:.2f}% ROI last window)")
+
+            print("\n2️⃣ P&L SNAPSHOT")
+            print(
+                f"   Overall P&L      : ₹{pnl_snapshot_old['overall_profit']:.0f} "
+                f"(ROI {pnl_snapshot_old['overall_roi']:.2f}%)"
+            )
+            print(
+                f"   Last 7 days      : ₹{pnl_snapshot_old['last7']['profit']:.0f} "
+                f"(ROI {pnl_snapshot_old['last7']['roi']:.2f}%)"
+            )
+            print(
+                f"   Last 30 days     : ₹{pnl_snapshot_old['last30']['profit']:.0f} "
+                f"(ROI {pnl_snapshot_old['last30']['roi']:.2f}%)"
+            )
+            print(f"   Best slot        : {pnl_snapshot_old['best_slot']}")
+            print(f"   Weak slot        : {pnl_snapshot_old['weak_slot']}")
+
+            print("\n3️⃣ PATTERN & LEARNING")
+            print(f"   Hits analyzed    : {pattern_stats['hits']}")
+            print(
+                f"   S40 family       : {pattern_stats['s40_hit_rate']:.1f}% hit rate, "
+                f"{pattern_stats['s40_hits']} hits"
+            )
+            print(
+                f"   164950 family    : {pattern_stats['pack_hit_rate']:.1f}% hit rate, "
+                f"{pattern_stats['pack_hits']} hits"
+            )
+
+            old_confidence = {k: v for k, v in old_pred["confidence"].items()}
+            old_risk = compute_risk_execution_summary(pnl_snapshot_old, pattern_stats, old_confidence, u_live)
+            print("\n4️⃣ RISK & EXECUTION")
+            print(f"   Strategy         : {old_risk['strategy']}")
+            print(f"   Risk mode        : {old_risk['risk_mode']}")
+            print(f"   Execution mode   : {old_risk['execution']}")
+            print(
+                f"   Money manager    : daily cap ₹{old_risk['money_manager']['daily_cap']:.0f}, "
+                f"single-slot cap ₹{old_risk['money_manager']['slot_cap']:.0f}"
+            )
+            conf_parts_old = ", ".join([f"{k} {v:.1f}%" for k, v in old_confidence.items()])
+            print(f"   Confidence       : {conf_parts_old}")
+            last_pred_block = old_pred
+
+        if args.mode == "COMPARE":
+            old_pred = build_mode_prediction(
+                scope_df,
+                tgt_date,
+                roi_table,
+                u_live,
+                intraday,
+                missing_slots,
+                latest_date,
+                dynamic_topk=False,
+            )
+            print("=== OLD vs NEW (slot-wise) ===")
+            for slot_name in SLOT_NAMES:
+                if intraday and tgt_date == latest_date and SLOT_MAP[slot_name] not in missing_slots:
+                    continue
+                new_line = next((ln for ln in new_pred["lines"] if ln.startswith(slot_name)), f"{slot_name}: -")
+                old_line = next((ln for ln in old_pred["lines"] if ln.startswith(slot_name)), f"{slot_name}: -")
+                print("\n==================================================")
+                print(f"SLOT: {slot_name} – OLD vs NEW")
+                print("--------------------------------------------------")
+                print(f"OLD: {old_line.split(': ',1)[1] if ': ' in old_line else old_line}")
+                print(f"NEW: {new_line.split(': ',1)[1] if ': ' in new_line else new_line}")
+
+                old_set = set(old_pred["picks_by_slot"].get(slot_name, []))
+                new_set = set(new_pred["picks_by_slot"].get(slot_name, []))
+                overlap = {two_digit(n) for n in old_set & new_set}
+                old_only = {two_digit(n) for n in old_set - new_set}
+                new_only = {two_digit(n) for n in new_set - old_set}
+                s40_old = {two_digit(n) for n in old_set if two_digit(n) in S40}
+                s40_new = {two_digit(n) for n in new_set if two_digit(n) in S40}
+                p164_old = {two_digit(n) for n in old_set if two_digit(n) in PACK_164950_FAMILY}
+                p164_new = {two_digit(n) for n in new_set if two_digit(n) in PACK_164950_FAMILY}
+                print("\nOVERLAP & PACK VIEW:")
+                print(f"  Numbers in both     : {sorted(overlap)}")
+                print(f"  OLD only            : {sorted(old_only)}")
+                print(f"  NEW only            : {sorted(new_only)}")
+                print(f"  S40 in OLD          : {sorted(s40_old)}")
+                print(f"  S40 in NEW          : {sorted(s40_new)}")
+                print(f"  164950 in OLD       : {sorted(p164_old)}")
+                print(f"  164950 in NEW       : {sorted(p164_new)}")
+
+            print("\n2️⃣ P&L SNAPSHOT")
+            print(
+                f"   OLD  : ₹{pnl_snapshot_old['overall_profit']:.0f} "
+                f"(ROI {pnl_snapshot_old['overall_roi']:.2f}%)"
+            )
+            print(
+                f"   NEW  : ₹{pnl_snapshot_new['overall_profit']:.0f} "
+                f"(ROI {pnl_snapshot_new['overall_roi']:.2f}%)"
+            )
+
+            print("\n3️⃣ PATTERN & LEARNING (shared history)")
+            print(f"   Hits analyzed    : {pattern_stats['hits']}")
+            print(
+                f"   S40 family       : {pattern_stats['s40_hit_rate']:.1f}% hit rate, "
+                f"{pattern_stats['s40_hits']} hits"
+            )
+            print(
+                f"   164950 family    : {pattern_stats['pack_hit_rate']:.1f}% hit rate, "
+                f"{pattern_stats['pack_hits']} hits"
+            )
+
+            print("\n4️⃣ RISK & EXECUTION (new brain guiding)")
+            conf_parts = ", ".join([f"{k} {v:.1f}%" for k, v in confidence_map.items()])
+            risk_summary = compute_risk_execution_summary(pnl_snapshot_new, pattern_stats, confidence_map, u_live)
+            print(f"   Strategy         : {risk_summary['strategy']}")
+            print(f"   Risk mode        : {risk_summary['risk_mode']}")
+            print(f"   Execution mode   : {risk_summary['execution']}")
+            print(
+                f"   Money manager    : daily cap ₹{risk_summary['money_manager']['daily_cap']:.0f}, "
+                f"single-slot cap ₹{risk_summary['money_manager']['slot_cap']:.0f}"
+            )
+            print(f"   Confidence       : {conf_parts}")
+            last_pred_block = new_pred
+
+    if last_pred_block:
+        strong_s40 = any(two_digit(x) in S40 for nums in last_pred_block["picks_by_slot"].values() for x in nums)
+        if strong_s40:
+            print("\n✨ S40 alignment detected in combined picks – treat as bonus confidence layer.")
 
 
 if __name__ == "__main__":
