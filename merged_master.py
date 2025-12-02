@@ -16,13 +16,16 @@ from __future__ import annotations
 import argparse
 import math
 import os
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 
 from quant_excel_loader import load_results_excel, SLOT_NAMES, SLOT_MAP
 from quant_data_core import load_results_dataframe
@@ -38,6 +41,9 @@ S40 = {
 FAMILY_DIGITS = {"0","1","4","5","6","9"}
 PACK_164950_FAMILY = {f"{a}{b}" for a in FAMILY_DIGITS for b in FAMILY_DIGITS}
 
+SHOW_COMPARISON = True
+BET_PLAN_FOLDER = os.path.join(os.getcwd(), "bet_plans")
+
 BASE_STAKE = 10.0
 RETURN_EXACT = 90
 RETURN_DIGIT = 9
@@ -52,11 +58,14 @@ def two_digit(n: int) -> str:
 
 def load_long_dataframe(path: str = "number prediction learn.xlsx") -> pd.DataFrame:
     df = load_results_excel(path)
-    if not df.empty:
-        df = df.copy()
-        df["date"] = pd.to_datetime(df["date"])
-        df["slot"] = df["slot"].astype(int)
-        df["number"] = df["number"].astype(int)
+    if df.empty:
+        return df
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df["slot"] = df["slot"].astype(int)
+    # Keep XX (closed day) rows out of the modelling dataframe
+    df = df[pd.notna(df["number"])]
+    df["number"] = df["number"].astype(int)
     return df
 
 
@@ -161,6 +170,102 @@ def compute_slot_confidence(scores: Dict[int, float]) -> float:
     total = sum(values)
     ratio = top3 / total if total else 0.0
     return round(min(100.0, ratio * 120), 1)
+
+
+def digit_features(num: int) -> Dict[str, int]:
+    tens, ones = num // 10, num % 10
+    digit_sum = tens + ones
+    is_prime = int(num in {2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97})
+    return {
+        "tens": tens,
+        "ones": ones,
+        "parity": (num % 2),
+        "digit_sum": digit_sum,
+        "sum_parity": digit_sum % 2,
+        "mod9": num % 9,
+        "is_prime": is_prime,
+    }
+
+
+def recent_hit_features(past_df: pd.DataFrame, date: pd.Timestamp, slot: int, num: int) -> Dict[str, float]:
+    if past_df.empty:
+        return {k: 0.0 for k in ["days_since_any", "days_since_slot", "hit7", "hit30", "hit90", "hit7_slot", "hit30_slot", "hit90_slot", "neighbor_recent", "mirror_recent"]}
+    look7 = date - timedelta(days=7)
+    look30 = date - timedelta(days=30)
+    look90 = date - timedelta(days=90)
+    subset7 = past_df[past_df["date"] >= look7]
+    subset30 = past_df[past_df["date"] >= look30]
+    subset90 = past_df[past_df["date"] >= look90]
+
+    hit7 = int(num in subset7["number"].values)
+    hit30 = int(num in subset30["number"].values)
+    hit90 = int(num in subset90["number"].values)
+
+    slot7 = subset7[subset7["slot"] == slot]
+    slot30 = subset30[subset30["slot"] == slot]
+    slot90 = subset90[subset90["slot"] == slot]
+    hit7_slot = int(num in slot7["number"].values)
+    hit30_slot = int(num in slot30["number"].values)
+    hit90_slot = int(num in slot90["number"].values)
+
+    last_any = past_df[past_df["number"] == num]["date"].max()
+    last_slot = past_df[(past_df["number"] == num) & (past_df["slot"] == slot)]["date"].max()
+    days_since_any = (date - last_any).days if pd.notna(last_any) else 120
+    days_since_slot = (date - last_slot).days if pd.notna(last_slot) else 120
+
+    neighbor_recent = 0.0
+    mirror_recent = 0.0
+    neighbors = {(num + 1) % 100, (num - 1) % 100}
+    mirror = int(f"{num%10}{num//10}")
+    if not subset30.empty:
+        neighbor_recent = int(any(n in subset30["number"].values for n in neighbors))
+        mirror_recent = int(mirror in subset30["number"].values)
+
+    return {
+        "days_since_any": float(days_since_any),
+        "days_since_slot": float(days_since_slot),
+        "hit7": float(hit7),
+        "hit30": float(hit30),
+        "hit90": float(hit90),
+        "hit7_slot": float(hit7_slot),
+        "hit30_slot": float(hit30_slot),
+        "hit90_slot": float(hit90_slot),
+        "neighbor_recent": float(neighbor_recent),
+        "mirror_recent": float(mirror_recent),
+    }
+
+
+def build_ml_features(df_long: pd.DataFrame) -> pd.DataFrame:
+    if df_long.empty:
+        return pd.DataFrame()
+    dates = sorted(df_long["date"].unique())
+    rows: List[Dict[str, float]] = []
+    for date in dates:
+        past_df = df_long[df_long["date"] < date]
+        day_rows = df_long[df_long["date"] == date]
+        for slot in [1, 2, 3, 4]:
+            actual_row = day_rows[day_rows["slot"] == slot]
+            if actual_row.empty:
+                continue
+            actual_num = int(actual_row.iloc[0]["number"])
+            for num in range(100):
+                feat = {"date": date, "slot": slot, "candidate": num}
+                feat.update(digit_features(num))
+                feat.update(recent_hit_features(past_df, date, slot, num))
+                feat["s40"] = float(two_digit(num) in S40)
+                feat["f164950"] = float(two_digit(num) in PACK_164950_FAMILY)
+                feat["target"] = 1 if num == actual_num else 0
+                rows.append(feat)
+    return pd.DataFrame(rows)
+
+
+def generate_feature_row(past_df: pd.DataFrame, date: pd.Timestamp, slot: int, num: int) -> Dict[str, float]:
+    feat = {"slot": slot, "candidate": num}
+    feat.update(digit_features(num))
+    feat.update(recent_hit_features(past_df, date, slot, num))
+    feat["s40"] = float(two_digit(num) in S40)
+    feat["f164950"] = float(two_digit(num) in PACK_164950_FAMILY)
+    return feat
 
 
 # --------------------------- LOGIC: SCR1 (LIGHT) ---------------------------
@@ -349,25 +454,56 @@ def scr45_predict(df: pd.DataFrame, target_date: pd.Timestamp, top_k: int = 5) -
     return out
 
 
-# ----------------------- LOGIC: SCR6 (PATTERN BOOST) -----------------------
+# ----------------------- LOGIC: SCR6 (ML PREDICTOR) -----------------------
+_SCR6_MODEL_CACHE: Dict[str, GradientBoostingClassifier] = {}
+
+
+def _train_scr6_model(df: pd.DataFrame) -> Optional[GradientBoostingClassifier]:
+    feats = build_ml_features(df)
+    if feats.empty:
+        return None
+    X = feats.drop(columns=["target", "date"])
+    y = feats["target"]
+    if y.sum() < 5:
+        return None
+    model = GradientBoostingClassifier(random_state=42)
+    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+    model.fit(X_train, y_train)
+    return model
+
+
 def scr6_predict(df: pd.DataFrame, target_date: pd.Timestamp, top_k: int = 5) -> Dict[int, List[int]]:
+    hist = df[df["date"] < target_date]
+    cache_key = f"{len(hist)}-{hist['date'].max()}"
+    model = _SCR6_MODEL_CACHE.get(cache_key)
+    if model is None:
+        model = _train_scr6_model(hist)
+        if model is not None:
+            _SCR6_MODEL_CACHE[cache_key] = model
+
     out: Dict[int, List[int]] = {}
+    if model is None or hist.empty:
+        for slot in [1, 2, 3, 4]:
+            nums = hist[hist["slot"] == slot]["number"].tolist()
+            freq = Counter(nums[-50:])
+            picks = [n for n, _ in freq.most_common(top_k)]
+            out[slot] = picks
+        return out
+
+    past_df = hist
     for slot in [1, 2, 3, 4]:
-        nums = df[df["slot"] == slot]["number"].tolist()
-        freq = Counter(nums[-50:])
-        base_scores = {n: freq.get(n, 0) for n in range(100)}
-        boosted = {}
-        for num, val in base_scores.items():
-            score = val
-            num_str = two_digit(num)
-            if num_str in S40:
-                score += 3
-            if num_str in PACK_164950_FAMILY:
-                score += 1.5
-            if nums and num == nums[-1]:
-                score += 0.5
-            boosted[num] = score
-        picks = [n for n, _ in sorted(boosted.items(), key=lambda x: x[1], reverse=True)[: top_k]]
+        scores: Dict[int, float] = {}
+        for num in range(100):
+            feat = generate_feature_row(past_df, target_date, slot, num)
+            X_row = pd.DataFrame([feat])
+            proba = float(model.predict_proba(X_row)[0][1])
+            bonus = 0.0
+            if two_digit(num) in S40:
+                bonus += 0.02
+            if two_digit(num) in PACK_164950_FAMILY:
+                bonus += 0.01
+            scores[num] = proba + bonus
+        picks = [n for n, _ in sorted(scores.items(), key=lambda x: x[1], reverse=True)[: top_k]]
         out[slot] = picks
     return out
 
@@ -509,6 +645,7 @@ def backtest_logic(df: pd.DataFrame, predictor, name: str, window: int = 60, top
 
 def compute_logic_performance_table(df_long: pd.DataFrame) -> Tuple[Dict[str, LogicPerformance], Dict[str, float], float]:
     perf_table: Dict[str, LogicPerformance] = {}
+    health_table: Dict[str, Dict[str, float]] = {}
     for name, func in [
         ("SCR1", scr1_predict),
         ("SCR2", scr2_predict),
@@ -519,23 +656,73 @@ def compute_logic_performance_table(df_long: pd.DataFrame) -> Tuple[Dict[str, Lo
         ("SCR8", lambda d, td, tk: scr8_predict(td, tk)),
     ]:
         perf_table[name] = backtest_logic(df_long, func, name)
+        health_table[name] = compute_layer_health(df_long, func)
     roi_table = {name: perf.roi for name, perf in perf_table.items()}
     cumulative_profit = sum(perf.profit for perf in perf_table.values())
-    return perf_table, roi_table, cumulative_profit
+    return perf_table, roi_table, cumulative_profit, health_table
+
+
+def compute_layer_health(df_long: pd.DataFrame, predictor, window: int = 120) -> Dict[str, float]:
+    dates = sorted(df_long["date"].unique())
+    if len(dates) < 5:
+        return {"roi7": 0.0, "roi30": 0.0, "roi90": 0.0, "sigma90": 0.0, "drawdown": 0.0}
+    start_idx = max(1, len(dates) - window)
+    profit_by_date: Dict[pd.Timestamp, float] = defaultdict(float)
+    stake_by_date: Dict[pd.Timestamp, float] = defaultdict(float)
+    stake = BASE_STAKE
+    for i in range(start_idx, len(dates)):
+        hist = df_long[df_long["date"] < dates[i]]
+        if hist.empty:
+            continue
+        preds = predictor(hist, dates[i], top_k=5)
+        day_rows = df_long[df_long["date"] == dates[i]]
+        for _, row in day_rows.iterrows():
+            slot = int(row["slot"])
+            actual_num = int(row["number"])
+            tens, ones = actual_num // 10, actual_num % 10
+            picks = preds.get(slot, [])
+            profit_delta = evaluate_day_predictions({"number": actual_num, "tens": tens, "ones": ones}, picks, *andar_bahar_from_predictions(picks), stake)
+            profit_by_date[dates[i]] += profit_delta
+            stake_by_date[dates[i]] += stake * len(picks) + 2 * stake
+    def roi_window(days: int) -> float:
+        start = dates[-1] - timedelta(days=days - 1)
+        p = sum(v for d, v in profit_by_date.items() if d >= start)
+        s = sum(v for d, v in stake_by_date.items() if d >= start)
+        return (p / s * 100) if s else 0.0
+    profits_sorted = [profit_by_date[d] for d in sorted(profit_by_date.keys())]
+    sigma90 = float(np.std(profits_sorted[-90:])) if profits_sorted else 0.0
+    running = 0.0
+    peak = 0.0
+    drawdown = 0.0
+    for p in profits_sorted:
+        running += p
+        peak = max(peak, running)
+        drawdown = min(drawdown, running - peak)
+    return {"roi7": roi_window(7), "roi30": roi_window(30), "roi90": roi_window(90), "sigma90": abs(sigma90), "drawdown": abs(drawdown)}
 
 
 def adjust_stake(profit_history: float, base: float = BASE_STAKE) -> float:
-    if profit_history < -100:
-        return base * 1.25
-    if profit_history < 0:
-        return base * 1.1
-    if profit_history > 200:
-        return base * 0.9
+    if profit_history < -150:
+        return base * 1.4
+    if profit_history < -50:
+        return base * 1.2
+    if profit_history > 300:
+        return base * 0.85
     return base
 
 
-def compute_roi_weights(roi_table: Dict[str, float]) -> Dict[str, float]:
-    return {name: max(0.1, roi + 1.0) for name, roi in roi_table.items()}
+def compute_roi_weights(roi_table: Dict[str, float], health_table: Optional[Dict[str, Dict[str, float]]] = None) -> Dict[str, float]:
+    weights = {}
+    for name, roi in roi_table.items():
+        gate = 1.0
+        if health_table and name in health_table:
+            stats = health_table[name]
+            if stats["roi30"] < -10 and stats["drawdown"] > 1.5 * stats.get("sigma90", 0):
+                gate = 0.0
+            elif stats["roi7"] < -5:
+                gate = 0.5
+        weights[name] = max(0.0, (roi + 1.0) * gate)
+    return weights
 
 
 def generate_all_logic_predictions(df: pd.DataFrame, target_date: pd.Timestamp, top_k: int = 5) -> Dict[str, Dict[int, List[int]]]:
@@ -561,10 +748,12 @@ def generate_all_logic_predictions(df: pd.DataFrame, target_date: pd.Timestamp, 
 def combine_predictions(
     pred_maps: Dict[str, Dict[int, List[int]]],
     roi_table: Dict[str, float],
+    health_table: Optional[Dict[str, Dict[str, float]]] = None,
+    risk_mode: str = "BALANCED",
     base_top_k: int = 5,
     dynamic_topk: bool = True,
 ) -> CombinedPrediction:
-    roi_weights = compute_roi_weights(roi_table)
+    roi_weights = compute_roi_weights(roi_table, health_table)
     slot_scores: Dict[int, Counter] = {slot: Counter() for slot in [1, 2, 3, 4]}
     for name, preds in pred_maps.items():
         weight = roi_weights.get(name, 1.0)
@@ -576,7 +765,18 @@ def combine_predictions(
     for slot, counter in slot_scores.items():
         k = decide_top_k_for_slot(counter, base_top_k) if dynamic_topk else base_top_k
         top_k_by_slot[slot] = max(3, min(base_top_k, k))
-        picks[slot] = [n for n, _ in counter.most_common(top_k_by_slot[slot])]
+        ranked = counter.most_common(20)
+        if ranked:
+            top_score = ranked[0][1]
+            ev_gate = 0.97 * top_score
+            filtered = [(n, s) for n, s in ranked if s >= ev_gate]
+            cap = 12 if risk_mode != "DEFENSIVE" else 8
+            if risk_mode == "AGGRESSIVE":
+                cap = 15
+            picks_list = [n for n, _ in filtered][:cap]
+        else:
+            picks_list = []
+        picks[slot] = picks_list[: top_k_by_slot[slot]]
     return CombinedPrediction(
         picks=picks,
         scores={slot: dict(counter) for slot, counter in slot_scores.items()},
@@ -614,7 +814,7 @@ def run_combined_backtest(
         if hist.empty:
             continue
         logic_preds = generate_all_logic_predictions(hist, target_date, top_k=5)
-        combined = combine_predictions(logic_preds, roi_table, dynamic_topk=dynamic_topk)
+        combined = combine_predictions(logic_preds, roi_table, risk_mode="BALANCED", dynamic_topk=dynamic_topk)
         flat_preds = [n for nums in combined.picks.values() for n in nums]
         andar, bahar = andar_bahar_from_predictions(flat_preds)
         day_stake = 0.0
@@ -673,6 +873,8 @@ def compute_pnl_snapshot(df_long: pd.DataFrame, roi_table: Dict[str, float], dyn
         "last30": {"profit": last30_profit, "roi": last30_roi},
         "best_slot": SLOT_NAMES[best_slot_idx - 1],
         "weak_slot": SLOT_NAMES[weak_slot_idx - 1],
+        "profit_by_date": sim["profit_by_date"],
+        "stake_by_date": sim["stake_by_date"],
     }
 
 
@@ -684,16 +886,88 @@ def compute_pattern_stats(df_long: pd.DataFrame) -> Dict[str, float]:
             "pack_hits": 0,
             "s40_hit_rate": 0.0,
             "pack_hit_rate": 0.0,
+            "near_miss": 0,
+            "hot_neighbors": [],
+            "golden_pack": None,
         }
     hits = len(df_long)
     s40_hits = sum(1 for n in df_long["number"] if two_digit(n) in S40)
     pack_hits = sum(1 for n in df_long["number"] if two_digit(n) in PACK_164950_FAMILY)
+    near_miss = 0
+    hot_neighbors: Counter = Counter()
+    recent_df = df_long[df_long["date"] >= df_long["date"].max() - timedelta(days=90)]
+    prev_numbers = {}
+    for _, row in recent_df.iterrows():
+        num = int(row["number"])
+        slot = int(row["slot"])
+        prev_numbers.setdefault(row["date"], {})[slot] = num
+    sorted_dates = sorted(prev_numbers.keys())
+    for i in range(1, len(sorted_dates)):
+        today = prev_numbers[sorted_dates[i]]
+        yesterday = prev_numbers[sorted_dates[i - 1]]
+        for slot, num in today.items():
+            for cand in yesterday.values():
+                if num in {(cand + 1) % 100, (cand - 1) % 100, int(f"{cand%10}{cand//10}")}:
+                    near_miss += 1
+                    hot_neighbors[num] += 1
+    hot_list = [two_digit(n) for n, _ in hot_neighbors.most_common(5)]
+
+    last30 = df_long[df_long["date"] >= df_long["date"].max() - timedelta(days=30)]
+    golden_pack = None
+    if not last30.empty:
+        counts = Counter(last30["number"])
+        pack = [n for n, c in counts.most_common(6) if c > 1][:3]
+        if pack:
+            hit_rate = sum(counts[n] for n in pack) / max(1, len(last30)) * 100
+            if hit_rate > 20:
+                golden_pack = {two_digit(n) for n in pack}
     return {
         "hits": hits,
         "s40_hits": s40_hits,
         "pack_hits": pack_hits,
         "s40_hit_rate": (s40_hits / hits * 100) if hits else 0.0,
         "pack_hit_rate": (pack_hits / hits * 100) if hits else 0.0,
+        "near_miss": near_miss,
+        "hot_neighbors": hot_list,
+        "golden_pack": golden_pack,
+    }
+
+
+def compute_money_manager(pnl_snapshot: Dict[str, object], confidence: Dict[str, float], base_unit: float = BASE_STAKE) -> Dict[str, object]:
+    roi30 = pnl_snapshot.get("last30", {}).get("roi", 0.0)
+    roi7 = pnl_snapshot.get("last7", {}).get("roi", 0.0)
+    volatility = float(np.std(list(pnl_snapshot.get("profit_by_date", {}).values())[-30:])) if pnl_snapshot.get("profit_by_date") else 0.0
+    streak_factor = 1.0
+    profits = list(pnl_snapshot.get("profit_by_date", {}).values())
+    if profits:
+        streak = deque(profits[-5:], maxlen=5)
+        if all(p <= 0 for p in streak):
+            streak_factor = 1.3
+        elif all(p >= 0 for p in streak):
+            streak_factor = 0.9
+
+    risk_mode = "BALANCED"
+    if roi30 > 15 and roi7 > 5:
+        risk_mode = "AGGRESSIVE"
+    elif roi30 < -10:
+        risk_mode = "DEFENSIVE"
+
+    u_live = base_unit * streak_factor
+    if risk_mode == "DEFENSIVE":
+        u_live *= 0.9
+    elif risk_mode == "AGGRESSIVE":
+        u_live *= 1.1
+
+    execution = "GO_LIVE_FULL" if risk_mode == "AGGRESSIVE" and volatility < abs(pnl_snapshot.get("overall_profit", 0.0)) / 20 else "GO_LIVE_LIGHT"
+    daily_cap = u_live * (60 if risk_mode == "DEFENSIVE" else 90)
+    slot_cap = daily_cap / 4
+    return {
+        "risk_mode": risk_mode,
+        "execution": execution,
+        "u_live": u_live,
+        "daily_cap": daily_cap,
+        "slot_cap": slot_cap,
+        "confidence": confidence,
     }
 
 
@@ -703,19 +977,15 @@ def compute_risk_execution_summary(
     confidence: Dict[str, float],
     u_live: float,
 ) -> Dict[str, object]:
+    money_state = compute_money_manager(pnl_snapshot, confidence, base_unit=u_live)
     roi = pnl_snapshot.get("overall_roi", 0.0)
-    if roi > 12:
-        risk_mode = "AGGRESSIVE"
-    elif roi > 0:
-        risk_mode = "NORMAL"
-    else:
-        risk_mode = "DEFENSIVE"
+    risk_mode = money_state["risk_mode"]
 
     strategy = "STRAT_S40_BOOST" if pattern_stats.get("s40_hit_rate", 0.0) > 32 else "BALANCED_ROI"
-    exec_mode = "GO_LIVE_FULL" if risk_mode == "AGGRESSIVE" else "GO_LIVE_LIGHT"
+    exec_mode = money_state["execution"]
     money_mgr = {
-        "daily_cap": u_live * 80,
-        "slot_cap": u_live * 20,
+        "daily_cap": money_state["daily_cap"],
+        "slot_cap": money_state["slot_cap"],
     }
     return {
         "strategy": strategy,
@@ -730,6 +1000,7 @@ def build_mode_prediction(
     scope_df: pd.DataFrame,
     tgt_date: pd.Timestamp,
     roi_table: Dict[str, float],
+    health_table: Dict[str, Dict[str, float]],
     u_live: float,
     intraday: bool,
     missing_slots: List[int],
@@ -737,7 +1008,8 @@ def build_mode_prediction(
     dynamic_topk: bool,
 ) -> Dict[str, object]:
     logic_preds = generate_all_logic_predictions(scope_df, tgt_date, top_k=5)
-    combined = combine_predictions(logic_preds, roi_table, dynamic_topk=dynamic_topk)
+    risk_mode = "AGGRESSIVE" if roi_table and max(roi_table.values()) > 15 else "BALANCED"
+    combined = combine_predictions(logic_preds, roi_table, health_table=health_table, risk_mode=risk_mode, dynamic_topk=dynamic_topk)
     flat_preds = [n for nums in combined.picks.values() for n in nums]
     andar, bahar = andar_bahar_from_predictions(flat_preds)
     andar_stake = ANDAR_BAHAR_MULTIPLIER * u_live
@@ -755,6 +1027,14 @@ def build_mode_prediction(
         slot_scores = combined.scores.get(slot_idx, {})
         tiered = assign_tiers(slot_scores, picks, u_live)
         line, slot_stake = format_slot_line_old_style(slot_name, tiered, andar, bahar, andar_stake, bahar_stake)
+        slot_cap = u_live * 25
+        if slot_stake > slot_cap:
+            scale = slot_cap / slot_stake
+            for item in tiered:
+                item["stake"] = max(1.0, item["stake"] * scale)
+            andar_stake_scaled = max(1.0, andar_stake * scale)
+            bahar_stake_scaled = max(1.0, bahar_stake * scale)
+            line, slot_stake = format_slot_line_old_style(slot_name, tiered, andar, bahar, andar_stake_scaled, bahar_stake_scaled)
         lines.append(line)
         slot_stakes[slot_name] = slot_stake
         confidence[slot_name] = compute_slot_confidence(slot_scores)
@@ -795,7 +1075,7 @@ def main():
         target_dates.append(latest_date)
     target_dates.append(latest_date + timedelta(days=1))
 
-    perf_table, roi_table, cumulative_profit = compute_logic_performance_table(df_long)
+    perf_table, roi_table, cumulative_profit, health_table = compute_logic_performance_table(df_long)
     u_live = adjust_stake(cumulative_profit, BASE_STAKE)
     pattern_stats = compute_pattern_stats(df_long)
     pnl_snapshot_new = compute_pnl_snapshot(df_long, roi_table, dynamic_topk=True)
@@ -816,6 +1096,7 @@ def main():
                 scope_df,
                 tgt_date,
                 roi_table,
+                health_table,
                 u_live,
                 intraday,
                 missing_slots,
@@ -860,6 +1141,16 @@ def main():
                 f"   164950 family    : {pattern_stats['pack_hit_rate']:.1f}% hit rate, "
                 f"{pattern_stats['pack_hits']} hits"
             )
+            print(
+                f"   Near-miss count  : {pattern_stats['near_miss']} | Hot neighbors: {', '.join(pattern_stats['hot_neighbors'])}"
+            )
+            if pattern_stats.get("golden_pack"):
+                print(f"   Golden pack      : {sorted(pattern_stats['golden_pack'])}")
+            print(
+                f"   Near-miss count  : {pattern_stats['near_miss']} | Hot neighbors: {', '.join(pattern_stats['hot_neighbors'])}"
+            )
+            if pattern_stats.get("golden_pack"):
+                print(f"   Golden pack      : {sorted(pattern_stats['golden_pack'])}")
 
             print("\n4️⃣ RISK & EXECUTION")
             print(f"   Strategy         : {risk_summary['strategy']}")
@@ -877,6 +1168,7 @@ def main():
                 scope_df,
                 tgt_date,
                 roi_table,
+                health_table,
                 u_live,
                 intraday,
                 missing_slots,
@@ -936,6 +1228,7 @@ def main():
                 scope_df,
                 tgt_date,
                 roi_table,
+                health_table,
                 u_live,
                 intraday,
                 missing_slots,
@@ -992,6 +1285,11 @@ def main():
                 f"   164950 family    : {pattern_stats['pack_hit_rate']:.1f}% hit rate, "
                 f"{pattern_stats['pack_hits']} hits"
             )
+            print(
+                f"   Near-miss count  : {pattern_stats['near_miss']} | Hot neighbors: {', '.join(pattern_stats['hot_neighbors'])}"
+            )
+            if pattern_stats.get("golden_pack"):
+                print(f"   Golden pack      : {sorted(pattern_stats['golden_pack'])}")
 
             print("\n4️⃣ RISK & EXECUTION (new brain guiding)")
             conf_parts = ", ".join([f"{k} {v:.1f}%" for k, v in confidence_map.items()])
