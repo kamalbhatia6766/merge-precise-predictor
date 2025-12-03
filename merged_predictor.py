@@ -174,22 +174,79 @@ def normalize_scores(scores):
 # PATTERN MEMORY MANAGEMENT #
 #############################
 
-def load_memory():
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
+def initialize_memory():
     return {
         "patterns": {},
         "script_weights": {f"scr{i}": 1.0 for i in range(1, 10)},
+        "pattern_weights": {},
+        "hit_memory": [],
+        "roi_trend": [],
+        "slump_flags": {},
+        "cross_hits": [],
+        "daily_performance": [],
         "loss_streak": 0,
-        "roi_trend": [900.0],
         "slump_guard": {slot: 0 for slot in SLOT_ORDER},
         "memory_rules": {"S40": list(S40), "family": list(PACK_164950_FAMILY)},
-        "hit_memory": {},
     }
+
+
+def load_memory():
+    mem_file = MEMORY_FILE
+    default_mem = initialize_memory()
+    if os.path.exists(mem_file):
+        try:
+            with open(mem_file, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            for key in default_mem:
+                if key not in loaded:
+                    loaded[key] = default_mem[key]
+            return loaded
+        except Exception:
+            return default_mem
+    return default_mem
+
+
+def ensure_memory_keys(mem):
+    required_keys = [
+        "roi_trend",
+        "patterns",
+        "script_weights",
+        "pattern_weights",
+        "hit_memory",
+        "slump_flags",
+        "cross_hits",
+        "daily_performance",
+        "loss_streak",
+        "slump_guard",
+        "memory_rules",
+    ]
+
+    for key in required_keys:
+        if key not in mem:
+            if key == "roi_trend":
+                mem[key] = []
+            elif key == "patterns":
+                mem[key] = {}
+            elif key == "script_weights":
+                mem[key] = {f"scr{i}": 1.0 for i in range(1, 10)}
+            elif key == "pattern_weights":
+                mem[key] = {}
+            elif key == "hit_memory":
+                mem[key] = []
+            elif key == "slump_flags":
+                mem[key] = {}
+            elif key == "cross_hits":
+                mem[key] = []
+            elif key == "daily_performance":
+                mem[key] = []
+            elif key == "loss_streak":
+                mem[key] = 0
+            elif key == "slump_guard":
+                mem[key] = {slot: 0 for slot in SLOT_ORDER}
+            elif key == "memory_rules":
+                mem[key] = {"S40": list(S40), "family": list(PACK_164950_FAMILY)}
+
+    return mem
 
 
 def save_memory(mem):
@@ -428,12 +485,76 @@ def run_backtest(df, days=30, picks=4):
     return {"roi": roi, "hits": hits, "bets": bets, "slot_roi": slot_roi}
 
 
+def get_actual_results(df, target_date):
+    day = df[df["date"].dt.date == pd.to_datetime(target_date).date()]
+    return [to_2d(num) for num in day["number"].tolist()]
+
+
+def weighted_aggregate(df, mem, weights, target_date):
+    hist = df[df["date"] < pd.to_datetime(target_date)]
+    if hist.empty:
+        return {"numbers": []}
+    algos = [scr1_logic, scr2_logic, scr3_logic, scr4_logic, scr5_logic, scr6_logic, scr7_logic, scr8_logic, scr9_logic]
+    slot_name = SLOT_ORDER[0]
+    votes = collections.Counter()
+    for algo, weight in zip(algos, weights):
+        seq = algo(hist, slot_name)
+        for rank, num in enumerate(seq[:10], start=1):
+            votes[num] += weight * (1.0 / rank)
+    ranked = [n for n, _ in votes.most_common()]
+    return {"numbers": ranked}
+
+
+def test_algorithm_combo(df, mem, weights):
+    dates = sorted(df["date"].dt.date.unique())
+    if len(dates) < 2:
+        return -100
+    test_days = min(7, len(dates) - 1)
+    hits = 0
+    bets = 0
+
+    for date in dates[-test_days:]:
+        preds = weighted_aggregate(df, mem, weights, date)
+        actual = get_actual_results(df, date)
+        if any(p in actual for p in preds.get("numbers", [])[:3]):
+            hits += 1
+        bets += 1
+
+    roi = (hits * 90 - bets) / bets * 100 if bets > 0 else -100
+    return roi
+
+
+def run_alternative_algorithms(df, mem):
+    combos = [
+        {"weights": [2.0, 1.0, 1.0, 0.5, 0.5, 0.5, 2.0, 1.5, 1.0], "name": "aggressive"},
+        {"weights": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], "name": "equal"},
+        {"weights": [0.5, 0.5, 2.0, 1.5, 1.0, 1.0, 0.5, 0.5, 2.0], "name": "defensive"},
+    ]
+
+    best_roi = -100
+    best_combo = combos[0]
+
+    for combo in combos:
+        roi = test_algorithm_combo(df, mem, combo["weights"])
+        if roi > best_roi:
+            best_roi = roi
+            best_combo = combo
+
+    return {"roi": best_roi, "combo": best_combo["name"], "weights": best_combo["weights"]}
+
+
 def recompute_if_needed(df, mem, base_roi):
-    if base_roi >= 500:
-        return base_roi
-    alt = run_backtest(df, days=20, picks=5)
-    mem["roi_trend"].append(max(base_roi, alt["roi"]))
-    return max(base_roi, alt["roi"])
+    if "roi_trend" not in mem:
+        mem["roi_trend"] = []
+
+    if base_roi < 500:
+        alt = run_alternative_algorithms(df, mem)
+        if alt["roi"] > base_roi:
+            mem["roi_trend"].append(alt["roi"])
+            return alt["roi"]
+
+    mem["roi_trend"].append(base_roi)
+    return base_roi
 
 
 ###############################
@@ -542,7 +663,7 @@ def render_risk_execution(strategy, risk_mode, execution, caps):
 
 def main():
     df = load_excel_data()
-    mem = load_memory()
+    mem = ensure_memory_keys(load_memory())
     patterns = update_pattern_memory(df, mem)
     base_bt = run_backtest(df, days=30, picks=4)
     last7_bt = run_backtest(df, days=7, picks=4)
