@@ -14,8 +14,10 @@ implementation lightweight but still faithful to the previous ecosystem.
 """
 from __future__ import annotations
 import argparse
+import csv
 import math
 import os
+import time
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -64,6 +66,7 @@ def load_long_dataframe(path: str = "number prediction learn.xlsx") -> pd.DataFr
     df["date"] = pd.to_datetime(df["date"])
     df["slot"] = df["slot"].astype(int)
     # Keep XX (closed day) rows out of the modelling dataframe
+    df["number"] = pd.to_numeric(df["number"], errors="coerce")
     df = df[pd.notna(df["number"])]
     df["number"] = df["number"].astype(int)
     return df
@@ -459,7 +462,11 @@ _SCR6_MODEL_CACHE: Dict[str, GradientBoostingClassifier] = {}
 
 
 def _train_scr6_model(df: pd.DataFrame) -> Optional[GradientBoostingClassifier]:
-    feats = build_ml_features(df)
+    if df.empty:
+        return None
+    recent_cutoff = df["date"].max() - timedelta(days=180)
+    scope_df = df[df["date"] >= recent_cutoff]
+    feats = build_ml_features(scope_df)
     if feats.empty:
         return None
     X = feats.drop(columns=["target", "date"])
@@ -543,16 +550,76 @@ DIGIT_BIAS = {
     "DSWR": {"tens": [9, 5, 7, 8, 0], "ones": [8, 6, 4, 3, 1]},
 }
 
+SCR8_EFFECTIVE_HOT: Dict[str, List[int]] = {}
+SCR8_EFFECTIVE_COLD: Dict[str, List[int]] = {}
+
+
+def compute_number_stats(df: pd.DataFrame, slot: int, windows: Tuple[int, ...] = (30, 60, 90)) -> Dict[int, Dict[str, float]]:
+    """
+    Compute per-number hit counts and hit rates for the given slot.
+
+    Returns a dict keyed by number with keys hits_XX/rate_XX for each window.
+    """
+
+    if df.empty:
+        return {}
+    stats: Dict[int, Dict[str, float]] = {num: {} for num in range(100)}
+    slot_df = df[df["slot"] == slot]
+    if slot_df.empty:
+        return stats
+    max_date = slot_df["date"].max()
+    for window in windows:
+        start_date = max_date - timedelta(days=window - 1)
+        window_df = slot_df[slot_df["date"] >= start_date]
+        total = len(window_df)
+        counts = Counter(window_df["number"])
+        for num in range(100):
+            hits = counts.get(num, 0)
+            stats[num][f"hits_{window}"] = float(hits)
+            stats[num][f"rate_{window}"] = float(hits) / max(1, total)
+    return stats
+
+
+def derive_scr8_packs_from_stats(
+    number_stats: Dict[int, Dict[str, float]], min_hits: int = 3, min_rate: float = 0.02
+) -> Tuple[set, set]:
+    """
+    Derive auto-learned hot/cold packs using blended 30/60/90-day performance.
+    """
+
+    auto_hot: List[Tuple[int, float]] = []
+    auto_cold: List[Tuple[int, float]] = []
+    for num, stats in number_stats.items():
+        hits30 = stats.get("hits_30", 0.0)
+        hits60 = stats.get("hits_60", 0.0)
+        hits90 = stats.get("hits_90", 0.0)
+        rate30 = stats.get("rate_30", 0.0)
+        rate60 = stats.get("rate_60", 0.0)
+        rate90 = stats.get("rate_90", 0.0)
+        blended_hits = hits30 * 1.2 + hits60 * 0.8 + hits90 * 0.5
+        blended_rate = rate30 * 0.5 + rate60 * 0.3 + rate90 * 0.2
+        hot_score = blended_hits + blended_rate * 80
+        cold_score = (1 - blended_rate) * 50 - blended_hits
+        if hits30 >= min_hits or blended_rate >= min_rate:
+            auto_hot.append((num, hot_score))
+        if blended_rate < min_rate * 0.6 and hits60 <= min_hits and hits90 <= (min_hits * 1.5):
+            auto_cold.append((num, cold_score))
+    auto_hot_sorted = [n for n, _ in sorted(auto_hot, key=lambda x: x[1], reverse=True)[:20]]
+    auto_cold_sorted = [n for n, _ in sorted(auto_cold, key=lambda x: x[1], reverse=True)[:15]]
+    return set(auto_hot_sorted), set(auto_cold_sorted)
+
 
 def scr8_predict(target_date: pd.Timestamp, top_k: int = 5) -> Dict[int, List[int]]:
     out: Dict[int, List[int]] = {}
     for slot_name, slot_idx in SLOT_MAP.items():
+        effective_hot = SCR8_EFFECTIVE_HOT.get(slot_name, SCR8_HOT.get(slot_name, []))
+        effective_cold = SCR8_EFFECTIVE_COLD.get(slot_name, SCR8_COLD.get(slot_name, []))
         scores = Counter()
         for num in range(100):
             score = 0.0
-            if num in SCR8_HOT.get(slot_name, []):
+            if num in effective_hot:
                 score += 2.0
-            if num in SCR8_COLD.get(slot_name, []):
+            if num in effective_cold:
                 score -= 0.5
             tens = num // 10
             ones = num % 10
@@ -609,7 +676,9 @@ def evaluate_day_predictions(actual: Dict[int, int], predicted: List[int], andar
     return returns - total_stake
 
 
-def backtest_logic(df: pd.DataFrame, predictor, name: str, window: int = 60, top_k: int = 5) -> LogicPerformance:
+def backtest_logic(
+    df: pd.DataFrame, predictor, name: str, window: int = 60, top_k: int = 5, mode: str = "full", log_every: int = 10
+) -> LogicPerformance:
     dates = sorted(df["date"].unique())
     if len(dates) < 2:
         return LogicPerformance(name, 0.0, 0.0, 0)
@@ -617,7 +686,10 @@ def backtest_logic(df: pd.DataFrame, predictor, name: str, window: int = 60, top
     profit = 0.0
     hits = 0
     stake = BASE_STAKE
-    for i in range(start_idx, len(dates)):
+    total_days = len(dates) - start_idx
+    for idx, i in enumerate(range(start_idx, len(dates)), start=1):
+        if log_every and idx % log_every == 0:
+            print(f"[perf] {name}: day {idx}/{total_days}")
         hist = df[df["date"] < dates[i]]
         if hist.empty:
             continue
@@ -643,10 +715,10 @@ def backtest_logic(df: pd.DataFrame, predictor, name: str, window: int = 60, top
     return LogicPerformance(name=name, roi=roi, profit=profit, hits=hits)
 
 
-def compute_logic_performance_table(df_long: pd.DataFrame) -> Tuple[Dict[str, LogicPerformance], Dict[str, float], float]:
+def compute_logic_performance_table(df_long: pd.DataFrame, mode: str = "full") -> Tuple[Dict[str, LogicPerformance], Dict[str, float], float, Dict[str, Dict[str, float]]]:
     perf_table: Dict[str, LogicPerformance] = {}
     health_table: Dict[str, Dict[str, float]] = {}
-    for name, func in [
+    logic_plan = [
         ("SCR1", scr1_predict),
         ("SCR2", scr2_predict),
         ("SCR3", scr3_predict),
@@ -654,15 +726,19 @@ def compute_logic_performance_table(df_long: pd.DataFrame) -> Tuple[Dict[str, Lo
         ("SCR5", scr45_predict),
         ("SCR6", scr6_predict),
         ("SCR8", lambda d, td, tk: scr8_predict(td, tk)),
-    ]:
-        perf_table[name] = backtest_logic(df_long, func, name)
-        health_table[name] = compute_layer_health(df_long, func)
+    ]
+    if mode == "fast":
+        logic_plan = [item for item in logic_plan if item[0] != "SCR6"]
+    for name, func in logic_plan:
+        window = 90 if mode == "full" else 45
+        perf_table[name] = backtest_logic(df_long, func, name, window=window, mode=mode)
+        health_table[name] = compute_layer_health(df_long, func, window=window)
     roi_table = {name: perf.roi for name, perf in perf_table.items()}
     cumulative_profit = sum(perf.profit for perf in perf_table.values())
     return perf_table, roi_table, cumulative_profit, health_table
 
 
-def compute_layer_health(df_long: pd.DataFrame, predictor, window: int = 120) -> Dict[str, float]:
+def compute_layer_health(df_long: pd.DataFrame, predictor, window: int = 120, log_every: int = 0) -> Dict[str, float]:
     dates = sorted(df_long["date"].unique())
     if len(dates) < 5:
         return {"roi7": 0.0, "roi30": 0.0, "roi90": 0.0, "sigma90": 0.0, "drawdown": 0.0}
@@ -670,7 +746,10 @@ def compute_layer_health(df_long: pd.DataFrame, predictor, window: int = 120) ->
     profit_by_date: Dict[pd.Timestamp, float] = defaultdict(float)
     stake_by_date: Dict[pd.Timestamp, float] = defaultdict(float)
     stake = BASE_STAKE
-    for i in range(start_idx, len(dates)):
+    total_days = len(dates) - start_idx
+    for idx, i in enumerate(range(start_idx, len(dates)), start=1):
+        if log_every and idx % log_every == 0:
+            print(f"[perf-health] {predictor.__name__}: day {idx}/{total_days}")
         hist = df_long[df_long["date"] < dates[i]]
         if hist.empty:
             continue
@@ -725,12 +804,14 @@ def compute_roi_weights(roi_table: Dict[str, float], health_table: Optional[Dict
     return weights
 
 
-def generate_all_logic_predictions(df: pd.DataFrame, target_date: pd.Timestamp, top_k: int = 5) -> Dict[str, Dict[int, List[int]]]:
+def generate_all_logic_predictions(
+    df: pd.DataFrame, target_date: pd.Timestamp, top_k: int = 5, mode: str = "full"
+) -> Dict[str, Dict[int, List[int]]]:
     p1 = scr1_predict(df, target_date, top_k)
     p2 = scr2_predict(df, target_date, top_k)
     p3 = scr3_predict(df, target_date, top_k)
     p45 = scr45_predict(df, target_date, top_k)
-    p6 = scr6_predict(df, target_date, top_k)
+    p6 = scr6_predict(df, target_date, top_k) if mode == "full" else {slot: [] for slot in [1, 2, 3, 4]}
     p8 = scr8_predict(target_date, top_k)
     p7 = scr7_predict([p1, p2, p3, p45, p6, p8], top_k)
     return {
@@ -789,7 +870,7 @@ def prediction_summary(pred: Dict[int, List[int]]) -> Dict[str, List[str]]:
 
 
 def run_combined_backtest(
-    df_long: pd.DataFrame, roi_table: Dict[str, float], dynamic_topk: bool = True, window: int = 60
+    df_long: pd.DataFrame, roi_table: Dict[str, float], dynamic_topk: bool = True, window: int = 60, mode: str = "full"
 ) -> Dict[str, object]:
     dates = sorted(df_long["date"].unique())
     if len(dates) < 2:
@@ -808,12 +889,15 @@ def run_combined_backtest(
     profit_by_date: defaultdict = defaultdict(float)
     stake_by_date: defaultdict = defaultdict(float)
 
-    for i in range(start_idx, len(dates)):
+    total_days = len(dates) - start_idx
+    for idx, i in enumerate(range(start_idx, len(dates)), start=1):
         target_date = dates[i]
+        if idx % 10 == 0:
+            print(f"[backtest] {idx}/{total_days} dates processed...")
         hist = df_long[df_long["date"] < target_date]
         if hist.empty:
             continue
-        logic_preds = generate_all_logic_predictions(hist, target_date, top_k=5)
+        logic_preds = generate_all_logic_predictions(hist, target_date, top_k=5, mode=mode)
         combined = combine_predictions(logic_preds, roi_table, risk_mode="BALANCED", dynamic_topk=dynamic_topk)
         flat_preds = [n for nums in combined.picks.values() for n in nums]
         andar, bahar = andar_bahar_from_predictions(flat_preds)
@@ -860,8 +944,9 @@ def compute_window(profit_by_date: Dict[pd.Timestamp, float], stake_by_date: Dic
     return profit, roi
 
 
-def compute_pnl_snapshot(df_long: pd.DataFrame, roi_table: Dict[str, float], dynamic_topk: bool) -> Dict[str, object]:
-    sim = run_combined_backtest(df_long, roi_table, dynamic_topk=dynamic_topk)
+def compute_pnl_snapshot(df_long: pd.DataFrame, roi_table: Dict[str, float], dynamic_topk: bool, mode: str = "full") -> Dict[str, object]:
+    window = 90 if mode == "full" else 45
+    sim = run_combined_backtest(df_long, roi_table, dynamic_topk=dynamic_topk, window=window, mode=mode)
     best_slot_idx = max(sim["profit_by_slot"], key=lambda k: sim["profit_by_slot"][k], default=1)
     weak_slot_idx = min(sim["profit_by_slot"], key=lambda k: sim["profit_by_slot"][k], default=1)
     last7_profit, last7_roi = compute_window(sim["profit_by_date"], sim["stake_by_date"], 7)
@@ -889,6 +974,7 @@ def compute_pattern_stats(df_long: pd.DataFrame) -> Dict[str, float]:
             "near_miss": 0,
             "hot_neighbors": [],
             "golden_pack": None,
+            "scr8_summary": {},
         }
     hits = len(df_long)
     s40_hits = sum(1 for n in df_long["number"] if two_digit(n) in S40)
@@ -921,6 +1007,27 @@ def compute_pattern_stats(df_long: pd.DataFrame) -> Dict[str, float]:
             hit_rate = sum(counts[n] for n in pack) / max(1, len(last30)) * 100
             if hit_rate > 20:
                 golden_pack = {two_digit(n) for n in pack}
+
+    scr8_summary: Dict[str, Dict[str, object]] = {}
+    for slot_name, slot_idx in SLOT_MAP.items():
+        stats_map = compute_number_stats(df_long, slot_idx)
+        auto_hot, auto_cold = derive_scr8_packs_from_stats(stats_map)
+        static_hot = set(SCR8_HOT.get(slot_name, []))
+        static_cold = set(SCR8_COLD.get(slot_name, []))
+        effective_hot = sorted(static_hot | set(auto_hot))
+        effective_cold = sorted((static_cold | set(auto_cold)) - set(effective_hot))
+        SCR8_EFFECTIVE_HOT[slot_name] = effective_hot
+        SCR8_EFFECTIVE_COLD[slot_name] = effective_cold
+
+        hottest = sorted(auto_hot, key=lambda n: stats_map.get(n, {}).get("rate_30", 0.0), reverse=True)[:3]
+        coldest = sorted(auto_cold, key=lambda n: stats_map.get(n, {}).get("rate_30", 0.0))[:3]
+        scr8_summary[slot_name] = {
+            "static_hot": len(static_hot),
+            "effective_hot": len(effective_hot),
+            "effective_cold": len(effective_cold),
+            "top_hot": [two_digit(n) for n in hottest],
+            "top_cold": [two_digit(n) for n in coldest],
+        }
     return {
         "hits": hits,
         "s40_hits": s40_hits,
@@ -930,6 +1037,7 @@ def compute_pattern_stats(df_long: pd.DataFrame) -> Dict[str, float]:
         "near_miss": near_miss,
         "hot_neighbors": hot_list,
         "golden_pack": golden_pack,
+        "scr8_summary": scr8_summary,
     }
 
 
@@ -996,6 +1104,66 @@ def compute_risk_execution_summary(
     }
 
 
+def append_prediction_history(
+    pred_block: Dict[str, object],
+    prediction_date: pd.Timestamp,
+    mode: str,
+    engine_mode: str,
+    leading_logic: str,
+    risk_mode: str,
+    path: str = "prediction_history.csv",
+):
+    """Append current run's predictions to a CSV for light auditing."""
+
+    fieldnames = [
+        "run_timestamp",
+        "prediction_date",
+        "mode",
+        "engine_mode",
+        "slot",
+        "predicted_numbers",
+        "andar",
+        "bahar",
+        "leading_logic",
+        "risk_mode",
+        "confidence",
+    ]
+    file_exists = os.path.exists(path)
+    run_ts = datetime.utcnow().isoformat()
+    andar_val = pred_block.get("andar", 0)
+    bahar_val = pred_block.get("bahar", 0)
+    confidence_map = pred_block.get("confidence", {})
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        for slot_name, picks in pred_block.get("picks_by_slot", {}).items():
+            writer.writerow(
+                {
+                    "run_timestamp": run_ts,
+                    "prediction_date": str(pd.Timestamp(prediction_date).date()),
+                    "mode": mode,
+                    "engine_mode": engine_mode,
+                    "slot": slot_name,
+                    "predicted_numbers": " ".join(two_digit(n) for n in picks),
+                    "andar": andar_val,
+                    "bahar": bahar_val,
+                    "leading_logic": leading_logic,
+                    "risk_mode": risk_mode,
+                    "confidence": confidence_map.get(slot_name, 0.0),
+                }
+            )
+
+
+def load_prediction_history(path: str = "prediction_history.csv") -> Optional[pd.DataFrame]:
+    if not os.path.exists(path):
+        return None
+    try:
+        return pd.read_csv(path)
+    except Exception:
+        return None
+
+
 def build_mode_prediction(
     scope_df: pd.DataFrame,
     tgt_date: pd.Timestamp,
@@ -1006,8 +1174,9 @@ def build_mode_prediction(
     missing_slots: List[int],
     latest_date: pd.Timestamp,
     dynamic_topk: bool,
+    mode: str,
 ) -> Dict[str, object]:
-    logic_preds = generate_all_logic_predictions(scope_df, tgt_date, top_k=5)
+    logic_preds = generate_all_logic_predictions(scope_df, tgt_date, top_k=5, mode=mode)
     risk_mode = "AGGRESSIVE" if roi_table and max(roi_table.values()) > 15 else "BALANCED"
     combined = combine_predictions(logic_preds, roi_table, health_table=health_table, risk_mode=risk_mode, dynamic_topk=dynamic_topk)
     flat_preds = [n for nums in combined.picks.values() for n in nums]
@@ -1054,9 +1223,24 @@ def build_mode_prediction(
 
 
 def main():
+    t0 = time.perf_counter()
     parser = argparse.ArgumentParser(description="Merged master predictor")
-    parser.add_argument("--mode", choices=["NEW", "OLD", "COMPARE"], default="NEW", help="Prediction mode")
+    parser.add_argument(
+        "--mode",
+        choices=["full", "fast", "NEW", "OLD", "COMPARE"],
+        default="full",
+        help="Speed mode (full/fast). Legacy engine keywords still supported for backward compatibility.",
+    )
+    parser.add_argument(
+        "--engine",
+        choices=["NEW", "OLD", "COMPARE"],
+        default=None,
+        help="Select prediction engine (NEW/OLD/COMPARE). Overrides legacy mode keywords if provided.",
+    )
     args = parser.parse_args()
+
+    speed_mode = "fast" if args.mode == "fast" else "full"
+    engine_mode = args.engine or (args.mode if args.mode in {"NEW", "OLD", "COMPARE"} else "NEW")
 
     print("=== MERGED MASTER PREDICTOR (SCR1–SCR9) ===")
     excel_path = "number prediction learn.xlsx"
@@ -1075,14 +1259,17 @@ def main():
         target_dates.append(latest_date)
     target_dates.append(latest_date + timedelta(days=1))
 
-    perf_table, roi_table, cumulative_profit, health_table = compute_logic_performance_table(df_long)
+    perf_table, roi_table, cumulative_profit, health_table = compute_logic_performance_table(df_long, mode=speed_mode)
     u_live = adjust_stake(cumulative_profit, BASE_STAKE)
     pattern_stats = compute_pattern_stats(df_long)
-    pnl_snapshot_new = compute_pnl_snapshot(df_long, roi_table, dynamic_topk=True)
-    pnl_snapshot_old = compute_pnl_snapshot(df_long, roi_table, dynamic_topk=False)
+    pnl_snapshot_new = compute_pnl_snapshot(df_long, roi_table, dynamic_topk=True, mode=speed_mode)
+    pnl_snapshot_old: Optional[Dict[str, object]] = None
+    if engine_mode in {"OLD", "COMPARE"} or (speed_mode == "full" and SHOW_COMPARISON):
+        pnl_snapshot_old = compute_pnl_snapshot(df_long, roi_table, dynamic_topk=False, mode=speed_mode)
     top_logic = max(perf_table.values(), key=lambda p: p.roi)
 
     last_pred_block: Optional[Dict[str, object]] = None
+    last_risk_mode: str = ""
 
     for tgt_date in target_dates:
         scope_df = df_long[df_long["date"] < tgt_date]
@@ -1091,7 +1278,7 @@ def main():
         header = "INTRADAY" if tgt_date == latest_date else "NEXT DAY"
         print(f"\n🗓️ Prediction date: {tgt_date.date()} ({header})")
 
-        if args.mode in {"NEW", "COMPARE"}:
+        if engine_mode in {"NEW", "COMPARE"}:
             new_pred = build_mode_prediction(
                 scope_df,
                 tgt_date,
@@ -1102,12 +1289,14 @@ def main():
                 missing_slots,
                 latest_date,
                 dynamic_topk=True,
+                mode=speed_mode,
             )
             confidence_map = new_pred["confidence"]
             risk_summary = compute_risk_execution_summary(pnl_snapshot_new, pattern_stats, confidence_map, u_live)
+            last_risk_mode = risk_summary.get("risk_mode", "")
             last_pred_block = new_pred
 
-        if args.mode == "NEW":
+        if engine_mode == "NEW":
             print("1️⃣ FINAL PREDICTIONS (NEW ENGINE)")
             for line in new_pred["lines"]:
                 print(f"   {line}")
@@ -1151,6 +1340,12 @@ def main():
             )
             if pattern_stats.get("golden_pack"):
                 print(f"   Golden pack      : {sorted(pattern_stats['golden_pack'])}")
+            if pattern_stats.get("scr8_summary"):
+                for slot_name, stats in pattern_stats["scr8_summary"].items():
+                    print(
+                        f"   SCR8 {slot_name}: hot {stats['effective_hot']} (base {stats['static_hot']}), "
+                        f"cold {stats['effective_cold']} | top hot {stats['top_hot']} | top cold {stats['top_cold']}"
+                    )
 
             print("\n4️⃣ RISK & EXECUTION")
             print(f"   Strategy         : {risk_summary['strategy']}")
@@ -1163,7 +1358,7 @@ def main():
             conf_parts = ", ".join([f"{k} {v:.1f}%" for k, v in confidence_map.items()])
             print(f"   Confidence       : {conf_parts}")
 
-        if args.mode == "OLD":
+        if engine_mode == "OLD":
             old_pred = build_mode_prediction(
                 scope_df,
                 tgt_date,
@@ -1174,6 +1369,7 @@ def main():
                 missing_slots,
                 latest_date,
                 dynamic_topk=False,
+                mode=speed_mode,
             )
             print("1️⃣ FINAL PREDICTIONS (OLD STYLE)")
             for line in old_pred["lines"]:
@@ -1222,8 +1418,9 @@ def main():
             conf_parts_old = ", ".join([f"{k} {v:.1f}%" for k, v in old_confidence.items()])
             print(f"   Confidence       : {conf_parts_old}")
             last_pred_block = old_pred
+            last_risk_mode = old_risk.get("risk_mode", "")
 
-        if args.mode == "COMPARE":
+        if engine_mode == "COMPARE":
             old_pred = build_mode_prediction(
                 scope_df,
                 tgt_date,
@@ -1234,6 +1431,7 @@ def main():
                 missing_slots,
                 latest_date,
                 dynamic_topk=False,
+                mode=speed_mode,
             )
             print("=== OLD vs NEW (slot-wise) ===")
             for slot_name in SLOT_NAMES:
@@ -1303,11 +1501,25 @@ def main():
             )
             print(f"   Confidence       : {conf_parts}")
             last_pred_block = new_pred
+            last_risk_mode = risk_summary.get("risk_mode", "")
+
+        if last_pred_block:
+            append_prediction_history(
+                last_pred_block,
+                tgt_date,
+                mode=speed_mode,
+                engine_mode=engine_mode,
+                leading_logic=top_logic.name,
+                risk_mode=last_risk_mode or "",
+            )
 
     if last_pred_block:
         strong_s40 = any(two_digit(x) in S40 for nums in last_pred_block["picks_by_slot"].values() for x in nums)
         if strong_s40:
             print("\n✨ S40 alignment detected in combined picks – treat as bonus confidence layer.")
+
+    elapsed = time.perf_counter() - t0
+    print(f"\n✅ Script completed in {elapsed:.1f} seconds (mode={speed_mode})")
 
 
 if __name__ == "__main__":
